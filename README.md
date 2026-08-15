@@ -10,11 +10,12 @@ Cloudflare R2. Runs in GitHub Actions on a daily cron; backfill any day by hand.
 data.gharchive.org/{date}-{0..23}.json.gz   (~3 GB compressed / ~30 GB raw)
         │  read over HTTPS via DuckDB httpfs
         ▼
-   read_json_auto(...)            # ignore_errors skips malformed lines
+   read_json_auto(...)            # ignore_errors=false fails on a bad line
         │  SELECT id, type, actor.login, repo.name, created_at::TIMESTAMP
         │  ORDER BY repo_name, created_at     (spills to runner disk)
         ▼
-   r2://<bucket>/gharchive/{date}.parquet     (PARQUET, ZSTD)
+   r2://<bucket>/{year}/{month}/{date}.parquet   (PARQUET, ZSTD)
+       e.g. r2://gharchive/2026/01/2026-01-01.parquet
 ```
 
 The 24 hourly files are passed to DuckDB as an **explicit list** — DuckDB does
@@ -112,5 +113,7 @@ on a repo cheap via Parquet row-group statistics.
   clean on real files, but if GHArchive ever serves a corrupt line for a day,
   re-run it after the source is corrected. Flip to `true` only if you'd rather
   tolerate occasional dropped lines.
-- Re-running a day overwrites `gharchive/{date}.parquet` in the bucket. Enable
-  R2 object versioning if you want prior outputs retained.
+- Output path is date-driven: `{year}/{month}/{date}.parquet`
+  (e.g. `2026/01/2026-01-01.parquet`), so there's no configurable prefix.
+- Re-running a day overwrites that date's object in the bucket. Enable R2
+  object versioning if you want prior outputs retained.

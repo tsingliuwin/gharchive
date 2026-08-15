@@ -7,6 +7,9 @@ ZSTD-compressed Parquet file to Cloudflare R2. Designed to run in GitHub
 Actions against a day of data (~30 GB uncompressed) with DuckDB spilling the
 sort to the runner's disk.
 
+Output object key (date-driven, no prefix):
+    {year}/{month}/{date}.parquet   e.g. 2026/01/2026-01-01.parquet
+
 Configuration via environment variables:
     R2_ACCOUNT_ID          Cloudflare account ID (builds the R2 endpoint). Skipped
                             when OUTPUT_LOCAL is set.
@@ -14,7 +17,6 @@ Configuration via environment variables:
     R2_SECRET_ACCESS_KEY    R2 secret access key (GitHub Actions secret).
     R2_BUCKET               R2 bucket to write into.
     DATE                    Optional. YYYY-MM-DD to process (default: yesterday UTC).
-    R2_PREFIX               Optional. Key prefix in the bucket (default: gharchive/).
     GHARCHIVE_BASE_URL      Optional. Base URL (default: https://data.gharchive.org).
 
 Local testing (no R2 credentials needed):
@@ -38,7 +40,6 @@ import duckdb
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # R2 bucket naming rules: lowercase alnum + hyphens, 3-63 chars.
 BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$")
-PREFIX_RE = re.compile(r"^[A-Za-z0-9_/.-]*$")
 LOCAL_PATH_RE = re.compile(r"^[A-Za-z0-9_./\-]+$")
 
 
@@ -49,7 +50,6 @@ class Config:
     secret_access_key: str
     bucket: str
     date: str
-    prefix: str
     base_url: str
     output_local: str  # "" => write to R2; else a local file path
     max_files: int  # 0 => all 24 hourly files
@@ -94,15 +94,9 @@ class Config:
         if not DATE_RE.match(date):
             fail(f"DATE must be YYYY-MM-DD, got: {date!r}")
 
-        prefix = os.environ.get("R2_PREFIX", "gharchive/").strip()
-        if prefix and not prefix.endswith("/"):
-            prefix += "/"
-        if not PREFIX_RE.match(prefix):
-            fail(f"R2_PREFIX contains disallowed characters: {prefix!r}")
-
         base_url = os.environ.get("GHARCHIVE_BASE_URL", "https://data.gharchive.org").strip().rstrip("/")
         return cls(account_id, access_key_id, secret_access_key, bucket, date,
-                    prefix, base_url, output_local, max_files)
+                    base_url, output_local, max_files)
 
     @property
     def uses_r2(self) -> bool:
@@ -110,11 +104,12 @@ class Config:
 
     @property
     def object_key(self) -> str:
-        return f"{self.prefix}{self.date}.parquet"
+        # 2026-01-01 -> 2026/01/2026-01-01.parquet
+        return f"{self.date[:4]}/{self.date[5:7]}/{self.date}.parquet"
 
     @property
     def r2_uri(self) -> str:
-        # bucket/prefix/date are charset-validated, so this is safe to embed in SQL.
+        # bucket is charset-validated, so this is safe to embed in SQL.
         return f"r2://{self.bucket}/{self.object_key}"
 
     @property
