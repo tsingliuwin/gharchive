@@ -10,13 +10,18 @@ sort to the runner's disk.
 Output object key (date-driven, no prefix):
     {year}/{month}/{date}.parquet   e.g. 2026/01/2026-01-01.parquet
 
+DATE input:
+    ""          yesterday (default; used by the daily cron)
+    YYYY-MM-DD  a single day
+    YYYY-MM     every day in that month (run locally: sequential; in Actions:
+                the workflow fans these out to parallel per-day jobs)
+
 Configuration via environment variables:
     R2_ACCOUNT_ID          Cloudflare account ID (builds the R2 endpoint). Skipped
                             when OUTPUT_LOCAL is set.
     R2_ACCESS_KEY_ID        R2 access key ID (GitHub Actions secret).
     R2_SECRET_ACCESS_KEY    R2 secret access key (GitHub Actions secret).
     R2_BUCKET               R2 bucket to write into.
-    DATE                    Optional. YYYY-MM-DD to process (default: yesterday UTC).
     GHARCHIVE_BASE_URL      Optional. Base URL (default: https://data.gharchive.org).
 
 Local testing (no R2 credentials needed):
@@ -27,6 +32,7 @@ Local testing (no R2 credentials needed):
 """
 from __future__ import annotations
 
+import calendar
 import os
 import re
 import sys
@@ -35,12 +41,39 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-import duckdb
-
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+MONTH_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 # R2 bucket naming rules: lowercase alnum + hyphens, 3-63 chars.
 BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$")
 LOCAL_PATH_RE = re.compile(r"^[A-Za-z0-9_./\-]+$")
+
+
+class ETLError(RuntimeError):
+    """A per-day failure (e.g. no source files, a malformed line). Caller
+    decides whether to abort (single-day) or record and continue (month)."""
+
+
+def fail(msg: str, code: int = 1) -> None:
+    print(f"ERROR: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def resolve_dates(raw: str) -> list[str]:
+    """Expand an input into concrete YYYY-MM-DD days.
+
+    ""          -> [yesterday]
+    YYYY-MM-DD  -> [that day]
+    YYYY-MM     -> every day in that month (handles leap years)
+    """
+    if not raw:
+        return [(datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")]
+    if DATE_RE.match(raw):
+        return [raw]
+    if MONTH_RE.match(raw):
+        year, month = int(raw[:4]), int(raw[5:7])
+        n_days = calendar.monthrange(year, month)[1]
+        return [f"{raw}-{d:02d}" for d in range(1, n_days + 1)]
+    fail(f"DATE must be YYYY-MM-DD or YYYY-MM, got: {raw!r}")
 
 
 @dataclass
@@ -55,7 +88,7 @@ class Config:
     max_files: int  # 0 => all 24 hourly files
 
     @classmethod
-    def from_env(cls) -> "Config":
+    def from_env(cls, date: str) -> "Config":
         output_local = os.environ.get("OUTPUT_LOCAL", "").strip()
         if output_local and not LOCAL_PATH_RE.match(output_local):
             fail(f"OUTPUT_LOCAL has disallowed characters: {output_local!r}")
@@ -88,9 +121,6 @@ class Config:
             if not BUCKET_RE.match(bucket):
                 fail(f"R2_BUCKET has an invalid name: {bucket!r}")
 
-        date = os.environ.get("DATE", "").strip()
-        if not date:
-            date = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
         if not DATE_RE.match(date):
             fail(f"DATE must be YYYY-MM-DD, got: {date!r}")
 
@@ -115,11 +145,6 @@ class Config:
     @property
     def destination(self) -> str:
         return self.output_local if self.output_local else self.r2_uri
-
-
-def fail(msg: str, code: int = 1) -> None:
-    print(f"ERROR: {msg}", file=sys.stderr)
-    sys.exit(code)
 
 
 def hourly_urls(cfg: Config) -> list[str]:
@@ -157,12 +182,14 @@ def run_etl(cfg: Config) -> None:
     urls = hourly_urls(cfg)
     existing = filter_existing(urls)
     if not existing:
-        fail(f"no source files found for {cfg.date} (tried {len(urls)} hourly URLs)")
+        raise ETLError(f"no source files found for {cfg.date} (tried {len(urls)} hourly URLs)")
 
     missing = len(urls) - len(existing)
     scope = f"max_files={cfg.max_files}" if cfg.max_files else "full_day"
     print(f"date={cfg.date} {scope} source_files={len(existing)}/{len(urls)}"
           + (f" missing={missing}" if missing else ""))
+
+    import duckdb  # lazy: lets the prepare job import this module without duckdb
 
     con = duckdb.connect()
     # httpfs is required even for the local run, since the source is read over HTTPS.
@@ -209,8 +236,38 @@ def run_etl(cfg: Config) -> None:
 
 
 def main() -> None:
-    cfg = Config.from_env()
-    run_etl(cfg)
+    raw = os.environ.get("DATE", "").strip()
+    dates = resolve_dates(raw)
+
+    if len(dates) == 1:
+        try:
+            run_etl(Config.from_env(dates[0]))
+        except ETLError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            sys.exit(1)
+        except Exception as e:
+            print(f"ERROR: {type(e).__name__}: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    # Month mode: process each day, tolerate per-day failures, summarize.
+    ok: list[str] = []
+    failed: list[tuple[str, str]] = []
+    for i, d in enumerate(dates, 1):
+        print(f"\n=== {d} ({i}/{len(dates)}) ===")
+        try:
+            run_etl(Config.from_env(d))
+            ok.append(d)
+        except ETLError as e:
+            failed.append((d, str(e)))
+        except Exception as e:
+            failed.append((d, f"{type(e).__name__}: {str(e)[:160]}"))
+
+    print(f"\n=== summary: {len(ok)} ok, {len(failed)} failed ===")
+    for d, why in failed:
+        print(f"  FAILED {d}: {why}")
+    if failed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

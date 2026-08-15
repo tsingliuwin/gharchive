@@ -2,7 +2,8 @@
 
 A one-file DuckDB ETL that turns a full day of GitHub Archive hourly
 `.json.gz` files into a single sorted, ZSTD-compressed Parquet file in
-Cloudflare R2. Runs in GitHub Actions on a daily cron; backfill any day by hand.
+Cloudflare R2. Runs in GitHub Actions on a daily cron; backfill a day or a whole
+month by hand.
 
 ## Pipeline
 
@@ -50,8 +51,16 @@ into the repo or the script.
 ## Run it
 
 Push the workflow. It runs automatically at 04:00 UTC each day for the previous
-day. To backfill a specific day, use **Actions → GHArchive to R2 → Run
-workflow** and enter a `YYYY-MM-DD`.
+day. To backfill, use **Actions → GHArchive to R2 → Run workflow** and enter
+either:
+
+- `YYYY-MM-DD` — one day, one job.
+- `YYYY-MM` — the whole month. A `prepare` job expands it into one matrix job
+  per day (up to 8 in parallel), each writing its own Parquet. One bad day
+  doesn't cancel the others (`fail-fast: false`); the run is red if any day
+  failed, and the job log names which days failed.
+
+Leave the field empty for yesterday (used by the daily cron).
 
 ## Testing
 
@@ -87,8 +96,8 @@ R2_BUCKET=gharchive DATE=2024-01-01 MAX_FILES=1 \
 ```
 
 **4. GitHub Actions** — push the repo, add the four secrets (below), then
-**Actions → GHArchive to R2 → Run workflow** with a `YYYY-MM-DD`. The 04:00 UTC
-cron handles the previous day automatically.
+**Actions → GHArchive to R2 → Run workflow** with a `YYYY-MM-DD` or `YYYY-MM`.
+The 04:00 UTC cron handles the previous day automatically.
 
 ## Output schema
 
