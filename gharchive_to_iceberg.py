@@ -232,7 +232,12 @@ def ensure_table(con: duckdb.DuckDBPyConnection, sample_url: str) -> None:
     schema_rows = con.sql(f"""
         DESCRIBE SELECT * FROM read_json_auto({sql_quote(sample_url)}, ignore_errors=false)
     """).fetchall()
-    columns = ",\n    ".join(f'"{row[0]}" {row[1]}' for row in schema_rows)
+    # Iceberg doesn't support DuckDB's JSON type — replace with VARCHAR
+    # so JSON fields (e.g. payload.milestone.closed_at, mirror_url, topics)
+    # are stored as JSON strings in a VARCHAR column.
+    columns = ",\n    ".join(
+        f'"{row[0]}" {row[1].replace("JSON", "VARCHAR")}' for row in schema_rows
+    )
     con.sql(f"""
         CREATE TABLE r2_catalog.gharchive.events (
             {columns}
