@@ -150,8 +150,8 @@ BATCH_MODE=hour (default, for daily incremental):
   data.gharchive.org/{date}-{0..23}.json.gz
           │  read one hour at a time via DuckDB httpfs
           ▼
-     read_json_auto(url, ignore_errors=false)
-          │  SELECT id, type, actor.login, repo.name, created_at::TIMESTAMP
+     read_json_auto(url, union_by_name=true, ignore_errors=false)
+          │  SELECT *  (full event schema — all 8 top-level fields)
           ▼
      INSERT INTO r2_catalog.gharchive.events   (Iceberg, partitioned by day)
          24 inserts/day → 24 snapshots → Iceberg compacts small files
@@ -160,8 +160,8 @@ BATCH_MODE=day (for backfill):
   data.gharchive.org/{date}-{0..23}.json.gz
           │  read all hours at once via DuckDB httpfs
           ▼
-     read_json_auto([url0, url1, ... url23], ignore_errors=false)
-          │  SELECT id, type, actor.login, repo.name, created_at::TIMESTAMP
+     read_json_auto([url0, url1, ... url23], union_by_name=true, ignore_errors=false)
+          │  SELECT *  (full event schema — all 8 top-level fields)
           ▼
      INSERT INTO r2_catalog.gharchive.events   (Iceberg, partitioned by day)
          1 insert/day → 1 snapshot
@@ -247,17 +247,25 @@ smoke test. `BATCH_MODE` can be `hour` (default) or `day`.
 
 ## Table schema
 
-| Column       | Type      | Notes                                  |
-| ------------ | --------- | -------------------------------------- |
-| `id`         | VARCHAR   | GitHub event id                         |
-| `type`       | VARCHAR   | Event type (PushEvent, WatchEvent, …)   |
-| `actor`      | VARCHAR   | `actor.login`                           |
-| `repo_name`  | VARCHAR   | `repo.name` (`owner/repo`)              |
-| `created_at` | TIMESTAMP | Event time (UTC, stored without tz)     |
+The table stores the **full GHArchive event** — all fields as inferred by
+DuckDB's `read_json_auto`, not a slim projection. The schema is inferred
+from a sample hourly file on first run and the table is created with
+explicit DDL + day partitioning.
 
-Partitioned by `day(created_at)`. No sort order is declared — Iceberg's
-built-in file-level min/max statistics provide basic pruning, and the day
-partition gives date-range pruning.
+| Column       | Type      | Notes                                              |
+| ------------ | --------- | -------------------------------------------------- |
+| `id`         | VARCHAR   | GitHub event id                                     |
+| `type`       | VARCHAR   | Event type (PushEvent, WatchEvent, …)               |
+| `actor`      | STRUCT    | `id`, `login`, `display_login`, `gravatar_id`, …   |
+| `repo`       | STRUCT    | `id`, `name`, `url`                                 |
+| `payload`    | STRUCT    | Event-specific payload (varies by type, deeply nested) |
+| `public`     | BOOLEAN   | Whether the repo is public                          |
+| `created_at` | TIMESTAMP | Event time (UTC)                                    |
+| `org`        | STRUCT    | `id`, `login`, `gravatar_id`, `url`, `avatar_url` (optional — NULL for non-org events) |
+
+Partitioned by `day(created_at)`. `union_by_name=true` on `read_json_auto`
+handles schema variations across hourly files (e.g. the optional `org`
+field is absent in files with no org events).
 
 ## Idempotency
 

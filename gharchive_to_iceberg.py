@@ -16,6 +16,11 @@ Two batch modes:
 Output table:
     r2_catalog.gharchive.events  (partitioned by day(created_at))
 
+The table stores the full GHArchive event schema as inferred by DuckDB's
+read_json_auto — all 8 top-level fields (id, type, actor, repo, payload,
+public, created_at, org) with their nested STRUCTs intact, not a slim
+projection.
+
 DATE input:
     ""          yesterday (default; used by the daily cron)
     YYYY-MM-DD  a single day
@@ -197,17 +202,43 @@ def day_has_data(con: duckdb.DuckDBPyConnection, date: str) -> bool:
 
 
 def _insert_select(src_sql: str) -> str:
-    """Build the common INSERT ... SELECT projection used by both batch modes."""
+    """Build the INSERT ... SELECT for all columns (no manual projection).
+
+    Uses SELECT * so DuckDB stores the full GHArchive event schema (id, type,
+    actor, repo, payload, public, created_at, org) with nested STRUCTs.
+    union_by_name handles schema variations across hourly files (e.g. the
+    optional `org` field is absent in files with no org events).
+    """
     return f"""
         INSERT INTO r2_catalog.gharchive.events BY NAME
-        SELECT
-            id::VARCHAR            AS id,
-            type::VARCHAR          AS type,
-            actor.login::VARCHAR   AS actor,
-            repo.name::VARCHAR     AS repo_name,
-            created_at::TIMESTAMP  AS created_at
-        FROM read_json_auto({src_sql}, ignore_errors=false)
+        SELECT * FROM read_json_auto({src_sql}, union_by_name=true, ignore_errors=false)
     """
+
+
+def ensure_table(con: duckdb.DuckDBPyConnection, sample_url: str) -> None:
+    """Create the Iceberg table from DuckDB's inferred schema if it doesn't exist.
+
+    Reads one hourly file with DESCRIBE to get the full column list (all
+    top-level fields + nested STRUCTs), then creates the table with explicit
+    DDL and day partitioning. This captures the complete GHArchive schema
+    instead of a hand-picked column subset.
+    """
+    try:
+        con.sql("SELECT 1 FROM r2_catalog.gharchive.events LIMIT 1")
+        return  # table already exists
+    except Exception:
+        pass  # table doesn't exist — create it
+
+    schema_rows = con.sql(f"""
+        DESCRIBE SELECT * FROM read_json_auto({sql_quote(sample_url)}, ignore_errors=false)
+    """).fetchall()
+    columns = ",\n    ".join(f'"{row[0]}" {row[1]}' for row in schema_rows)
+    con.sql(f"""
+        CREATE TABLE r2_catalog.gharchive.events (
+            {columns}
+        ) PARTITIONED BY (day(created_at));
+    """)
+    print(f"  table created ({len(schema_rows)} columns from schema inference)")
 
 
 def sql_with_retry(con: duckdb.DuckDBPyConnection, sql: str, label: str) -> None:
@@ -281,17 +312,10 @@ def run_etl(cfg: Config) -> None:
         );
     """)
 
-    # Create schema and table (idempotent — safe to run every time).
+    # Create schema (idempotent). Table is created on first run via
+    # ensure_table, which infers the full schema from a sample file.
     con.sql("CREATE SCHEMA IF NOT EXISTS r2_catalog.gharchive;")
-    con.sql("""
-        CREATE TABLE IF NOT EXISTS r2_catalog.gharchive.events (
-            id VARCHAR,
-            type VARCHAR,
-            actor VARCHAR,
-            repo_name VARCHAR,
-            created_at TIMESTAMP
-        ) PARTITIONED BY (day(created_at));
-    """)
+    ensure_table(con, existing_urls[0])
 
     if cfg.batch_mode == "day":
         _run_day_batch(con, cfg, existing_urls, missing)
