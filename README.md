@@ -126,3 +126,132 @@ on a repo cheap via Parquet row-group statistics.
   (e.g. `2026/01/2026-01-01.parquet`), so there's no configurable prefix.
 - Re-running a day overwrites that date's object in the bucket. Enable R2
   object versioning if you want prior outputs retained.
+
+---
+
+# GHArchive → Cloudflare R2 (Apache Iceberg)
+
+A second pipeline that writes each hour of GitHub Archive data directly into
+an Apache Iceberg table on the R2 Data Catalog. Instead of pre-combining 24
+hours into one Parquet file, each hour is a separate `INSERT` — Iceberg
+handles file layout and small-file compaction automatically. Querying an
+Iceberg table is as natural as querying a regular table.
+
+## Pipeline
+
+```
+data.gharchive.org/{date}-{0..23}.json.gz
+        │  read over HTTPS via DuckDB httpfs (one hour at a time)
+        ▼
+   read_json_auto(url, ignore_errors=false)
+        │  SELECT id, type, actor.login, repo.name, created_at::TIMESTAMP
+        ▼
+   INSERT INTO r2_catalog.gharchive.events   (Iceberg, partitioned by day)
+       24 inserts/day → 24 snapshots → Iceberg compacts small files
+```
+
+The table is partitioned by `day(created_at)`, so date-range queries prune
+to the relevant partitions. Missing or still-uploading hourly files are
+skipped after a HEAD check, and each hour is idempotent (re-runs only
+process hours not yet written).
+
+## Set up the R2 Data Catalog
+
+1. Install or update `wrangler` (Cloudflare CLI):
+   ```bash
+   npm install -g wrangler
+   wrangler login
+   ```
+
+2. Enable the Data Catalog on your R2 bucket. This produces a **Warehouse
+   name** and a **Catalog URI**:
+   ```bash
+   wrangler r2 bucket catalog enable <BUCKET_NAME>
+   ```
+
+3. Create an R2 API token with **Admin Read & Write** permission for both
+   **R2 Data Catalog** and **R2 Storage**. In the Cloudflare dashboard:
+   **R2 → Manage R2 API Tokens → Create API Token**.
+
+   The token covers both catalog API access and underlying data-file
+   writes — the catalog vendors SigV4 credentials to DuckDB for R2 storage,
+   so no separate S3 keys are needed.
+
+## Add the GitHub Actions secrets
+
+In the repo **Settings → Secrets and variables → Actions → New repository
+secret**, add:
+
+| Secret name        | Value                                |
+| ------------------ | ------------------------------------ |
+| `R2_CATALOG_URI`    | Catalog URI from `catalog enable`   |
+| `R2_WAREHOUSE`      | Warehouse name from `catalog enable` |
+| `R2_API_TOKEN`      | R2 API token (Data Catalog + Storage) |
+
+## Run it
+
+Push the `gharchive-to-iceberg.yml` workflow. It runs at 04:00 UTC each day
+for the previous day. To backfill, use **Actions → GHArchive to Iceberg →
+Run workflow** and enter either:
+
+- `YYYY-MM-DD` — one day, one job.
+- `YYYY-MM` — the whole month. A `prepare` job fans out to one matrix job
+  per day (up to 4 in parallel). `max-parallel` is 4 (not 8) to reduce
+  concurrent commit conflicts on the shared Iceberg table; the script also
+  retries on commit failures with exponential backoff.
+
+Leave the field empty for yesterday (used by the daily cron).
+
+## Testing
+
+**One hour, real R2 credentials (~90 s)** — verifies the full path: R2
+Data Catalog connection, table creation, JSON read, INSERT, and read-back.
+
+```bash
+R2_CATALOG_URI=... R2_WAREHOUSE=... R2_API_TOKEN=... \
+  DATE=2024-01-01 MAX_HOURS=1 \
+  .venv/bin/python gharchive_to_iceberg.py
+```
+
+`MAX_HOURS=1` limits the run to the first hourly file for a quick smoke
+test. `MAX_HOURS` can be 1–24.
+
+## Table schema
+
+| Column       | Type      | Notes                                  |
+| ------------ | --------- | -------------------------------------- |
+| `id`         | VARCHAR   | GitHub event id                         |
+| `type`       | VARCHAR   | Event type (PushEvent, WatchEvent, …)   |
+| `actor`      | VARCHAR   | `actor.login`                           |
+| `repo_name`  | VARCHAR   | `repo.name` (`owner/repo`)              |
+| `created_at` | TIMESTAMP | Event time (UTC, stored without tz)     |
+
+Partitioned by `day(created_at)`. No sort order is declared — Iceberg's
+built-in file-level min/max statistics provide basic pruning, and the day
+partition gives date-range pruning.
+
+## Idempotency
+
+Before INSERTing an hour, the script checks whether the table already has
+rows for that hour (`SELECT 1 … LIMIT 1`). If it does, that hour is
+skipped. This means:
+
+- Re-running a completed day is a no-op.
+- Re-running a partially failed day only processes the hours that were not
+  yet written.
+
+Iceberg INSERTs are atomic — a failed commit leaves no partial data, so a
+retry (manual or automatic) won't create duplicates.
+
+## Notes
+
+- The R2 Data Catalog is in public beta. Check the [Cloudflare R2 Data
+  Catalog docs](https://developers.cloudflare.com/r2-data-catalog/) for
+  the current limitations.
+- DuckDB's `iceberg` extension is marked experimental. APIs may change
+  between releases.
+- The old Parquet pipeline (`gharchive_to_r2.py` / `gharchive-to-r2.yml`)
+  is left untouched. Disable its workflow when you no longer need it.
+- Compaction and snapshot expiration are managed by the R2 Data Catalog
+  (see Cloudflare docs). You can also trigger compaction from DuckDB or
+  PyIceberg if needed.
