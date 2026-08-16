@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DuckDB-Wasm Iceberg Test</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: 'SF Mono', Menlo, monospace; padding: 24px; max-width: 960px; margin: 0 auto; }
+    h1 { font-size: 20px; }
+    .field { margin-bottom: 12px; }
+    .field label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 4px; }
+    .field input { width: 100%; padding: 8px; font-family: inherit; font-size: 13px; border: 1px solid #ccc; border-radius: 4px; }
+    button { padding: 10px 24px; font-size: 14px; cursor: pointer; background: #4f46e5; color: #fff; border: none; border-radius: 4px; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    pre { background: #1e1e1e; color: #d4d4d4; padding: 16px; border-radius: 6px; overflow-x: auto; white-space: pre-wrap; font-size: 12px; max-height: 600px; overflow-y: auto; }
+    .hint { font-size: 12px; color: #666; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <h1>DuckDB-Wasm Iceberg Test</h1>
+  <p>Tests whether DuckDB-Wasm can query the Iceberg table on the R2 Data Catalog from the browser.</p>
+
+  <div class="field">
+    <label>R2 Catalog URI</label>
+    <input id="catalogUri" type="text" placeholder="https://...catalog.uri...">
+  </div>
+  <div class="field">
+    <label>R2 Warehouse</label>
+    <input id="warehouse" type="text" placeholder="warehouse name">
+  </div>
+  <div class="field">
+    <label>R2 API Token</label>
+    <input id="apiToken" type="password" placeholder="r2 api token">
+  </div>
+
+  <button id="runBtn">Run Test</button>
+  <div class="hint" id="status">Fill in credentials and click Run Test.</div>
+
+  <pre id="output"></pre>
+
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
