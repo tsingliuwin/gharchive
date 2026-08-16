@@ -208,10 +208,19 @@ def _insert_select(src_sql: str) -> str:
     actor, repo, payload, public, created_at, org) with nested STRUCTs.
     union_by_name handles schema variations across hourly files (e.g. the
     optional `org` field is absent in files with no org events).
+
+    sample_size=100000: DuckDB reads more rows before deciding column types,
+    reducing the chance of misinferring a field as numerical when it sometimes
+    contains a string (e.g. a field that's usually a number but has "2026-07-17"
+    in rare event types).
+
+    ignore_errors=true: as a safety net, skip any remaining rows that don't
+    match the inferred schema. A handful of events out of millions may be
+    dropped — acceptable for analytics.
     """
     return f"""
         INSERT INTO r2_catalog.gharchive.events BY NAME
-        SELECT * FROM read_json_auto({src_sql}, union_by_name=true, ignore_errors=false)
+        SELECT * FROM read_json_auto({src_sql}, union_by_name=true, sample_size=100000, ignore_errors=true)
     """
 
 
@@ -230,7 +239,7 @@ def ensure_table(con: duckdb.DuckDBPyConnection, sample_url: str) -> None:
         pass  # table doesn't exist — create it
 
     schema_rows = con.sql(f"""
-        DESCRIBE SELECT * FROM read_json_auto({sql_quote(sample_url)}, ignore_errors=false)
+        DESCRIBE SELECT * FROM read_json_auto({sql_quote(sample_url)}, sample_size=100000, ignore_errors=true)
     """).fetchall()
     # Iceberg doesn't support DuckDB's JSON type — replace with VARCHAR
     # so JSON fields (e.g. payload.milestone.closed_at, mirror_url, topics)
