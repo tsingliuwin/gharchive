@@ -1,0 +1,9 @@
+name = "iceberg-cors-proxy"
+main = "src/index.js"
+compatibility_date = "2024-12-01"
+
+# Deploy:
+#   cd wasm-test/worker && npx wrangler deploy
+#
+# Then use the Worker URL as your Catalog URI in the DuckDB-Wasm test:
+#   https://iceberg-cors-proxy.<your-subdomain>.workers.dev/<account-id>/<bucket-name>

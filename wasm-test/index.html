@@ -21,6 +21,27 @@
   <h1>DuckDB-Wasm Iceberg Test</h1>
   <p>Tests whether DuckDB-Wasm can query the Iceberg table on the R2 Data Catalog from the browser.</p>
 
+  <details>
+    <summary><b>Setup (first time only)</b></summary>
+    <p>The R2 Data Catalog endpoint doesn't return CORS headers, so browser
+    requests are blocked. Two things are needed:</p>
+    <ol>
+      <li>
+        <b>Deploy the CORS proxy Worker</b> (for catalog API requests):
+        <pre>cd wasm-test/worker && npx wrangler deploy</pre>
+        This gives you a URL like
+        <code>https://iceberg-cors-proxy.<i>your-subdomain</i>.workers.dev</code>.
+        Use <b>that URL + your catalog path</b> as the Catalog URI below.
+      </li>
+      <li>
+        <b>Configure R2 bucket CORS</b> (for data file access):
+        <pre>wrangler r2 bucket cors put &lt;bucket-name&gt; \
+  --rules '[{"allowedOrigins":["*"],"allowedMethods":["GET","HEAD"],"allowedHeaders":["*"]}]'</pre>
+        Or via Cloudflare dashboard: R2 → bucket → Settings → CORS Policy.
+      </li>
+    </ol>
+  </details>
+
   <div class="field">
     <label>R2 Catalog URI</label>
     <input id="catalogUri" type="text" placeholder="https://...catalog.uri...">
