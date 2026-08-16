@@ -12,5 +12,20 @@ export default defineConfig({
       'Cross-Origin-Opener-Policy': 'same-origin',
       'Cross-Origin-Embedder-Policy': 'require-corp',
     },
+    // Proxy catalog API requests to the R2 Data Catalog endpoint.
+    // This avoids CORS issues: the browser sees same-origin requests
+    // (http://localhost:5173/catalog/...), and Vite forwards them to
+    // https://catalog.cloudflarestorage.com/...
+    //
+    // Catalog URI in the test page should be set to:
+    //   http://localhost:5173/catalog/<account-id>/<bucket-name>
+    proxy: {
+      '/catalog': {
+        target: 'https://catalog.cloudflarestorage.com',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/catalog/, ''),
+        secure: true,
+      },
+    },
   },
 });
