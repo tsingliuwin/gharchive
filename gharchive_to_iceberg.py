@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
-"""GHArchive hourly -> Cloudflare R2 Iceberg ETL.
+"""GHArchive -> Cloudflare R2 Iceberg ETL.
 
-Reads each hour of GitHub Archive `.json.gz` and INSERTs it directly into
-an Apache Iceberg table managed by the Cloudflare R2 Data Catalog. No daily
-pre-combining — each hour is a separate INSERT, and Iceberg handles file
-layout and small-file compaction automatically.
+Reads GitHub Archive `.json.gz` files and INSERTs them into an Apache
+Iceberg table managed by the Cloudflare R2 Data Catalog. Iceberg handles
+file layout and small-file compaction automatically — no manual pre-combining.
+
+Two batch modes:
+
+    BATCH_MODE=hour  (default)  One INSERT per hour (24 commits/day).
+                               Best for daily incremental updates.
+    BATCH_MODE=day              One INSERT per day, all hours batched
+                               into a single read_json_auto call (1 commit/day).
+                               Best for backfilling historical data.
 
 Output table:
     r2_catalog.gharchive.events  (partitioned by day(created_at))
@@ -19,6 +26,7 @@ Configuration via environment variables:
     R2_CATALOG_URI     R2 Data Catalog endpoint URI
     R2_WAREHOUSE       R2 Data Catalog warehouse name
     R2_API_TOKEN       R2 API token (Data Catalog + Storage r/w)
+    BATCH_MODE         Optional. 'hour' (default) or 'day'.
     GHARCHIVE_BASE_URL Optional. Base URL (default: https://data.gharchive.org).
     MAX_HOURS          Optional. Process only the first N hourly files (1-24),
                         for a fast test. e.g. MAX_HOURS=1
@@ -87,6 +95,7 @@ class Config:
     date: str
     base_url: str
     max_hours: int  # 0 => all 24 hourly files
+    batch_mode: str  # "hour" or "day"
 
     @classmethod
     def from_env(cls, date: str) -> "Config":
@@ -110,11 +119,15 @@ class Config:
             if not 1 <= max_hours <= 24:
                 fail(f"MAX_HOURS must be 1-24, got: {max_hours}")
 
+        batch_mode = os.environ.get("BATCH_MODE", "hour").strip().lower()
+        if batch_mode not in ("hour", "day"):
+            fail(f"BATCH_MODE must be 'hour' or 'day', got: {batch_mode!r}")
+
         if not DATE_RE.match(date):
             fail(f"DATE must be YYYY-MM-DD, got: {date!r}")
 
         base_url = os.environ.get("GHARCHIVE_BASE_URL", "https://data.gharchive.org").strip().rstrip("/")
-        return cls(catalog_uri, warehouse, api_token, date, base_url, max_hours)
+        return cls(catalog_uri, warehouse, api_token, date, base_url, max_hours, batch_mode)
 
 
 def hourly_urls(cfg: Config) -> list[str]:
@@ -144,6 +157,11 @@ def sql_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def sql_list_literal(items: list[str]) -> str:
+    """Build a SQL list literal: ['a', 'b', 'c']."""
+    return "[" + ", ".join(sql_quote(i) for i in items) + "]"
+
+
 def hour_ts_literal(date: str, hour: int) -> str:
     """Build a TIMESTAMP literal: TIMESTAMP '2026-01-01 05:00:00'."""
     return f"TIMESTAMP '{date} {hour:02d}:00:00'"
@@ -167,13 +185,20 @@ def hour_has_data(con: duckdb.DuckDBPyConnection, date: str, hour: int) -> bool:
     return result is not None
 
 
-def insert_hour(con: duckdb.DuckDBPyConnection, date: str, hour: int, url: str) -> None:
-    """INSERT one hour of GHArchive data into the Iceberg table.
+def day_has_data(con: duckdb.DuckDBPyConnection, date: str) -> bool:
+    """Check whether the Iceberg table already has rows for this day."""
+    result = con.sql(f"""
+        SELECT 1 FROM r2_catalog.gharchive.events
+        WHERE created_at >= TIMESTAMP '{date} 00:00:00'
+          AND created_at <  TIMESTAMP '{date} 00:00:00' + INTERVAL 1 day
+        LIMIT 1
+    """).fetchone()
+    return result is not None
 
-    Retries on Iceberg commit conflict (concurrent writers in month backfill).
-    Iceberg INSERTs are atomic — a failed commit leaves no partial data.
-    """
-    insert_sql = f"""
+
+def _insert_select(src_sql: str) -> str:
+    """Build the common INSERT ... SELECT projection used by both batch modes."""
+    return f"""
         INSERT INTO r2_catalog.gharchive.events BY NAME
         SELECT
             id::VARCHAR            AS id,
@@ -181,23 +206,41 @@ def insert_hour(con: duckdb.DuckDBPyConnection, date: str, hour: int, url: str) 
             actor.login::VARCHAR   AS actor,
             repo.name::VARCHAR     AS repo_name,
             created_at::TIMESTAMP  AS created_at
-        FROM read_json_auto({sql_quote(url)}, ignore_errors=false)
+        FROM read_json_auto({src_sql}, ignore_errors=false)
+    """
+
+
+def sql_with_retry(con: duckdb.DuckDBPyConnection, sql: str, label: str) -> None:
+    """Execute a write SQL statement with retry on Iceberg commit conflict.
+
+    Iceberg INSERTs are atomic — a failed commit leaves no partial data,
+    so a retry (manual or automatic) won't create duplicates.
     """
     last_exc: Exception | None = None
     for attempt in range(MAX_RETRIES):
         try:
-            con.sql(insert_sql)
+            con.sql(sql)
             return
         except Exception as e:
             last_exc = e
             if is_commit_conflict(e) and attempt < MAX_RETRIES - 1:
                 delay = RETRY_BASE_DELAY * (2 ** attempt)
-                print(f"  hour={hour} commit conflict, retry {attempt + 1}/{MAX_RETRIES} in {delay}s ...")
+                print(f"  {label}: commit conflict, retry {attempt + 1}/{MAX_RETRIES} in {delay}s ...")
                 time.sleep(delay)
                 continue
             raise
     if last_exc:
         raise last_exc
+
+
+def insert_hour(con: duckdb.DuckDBPyConnection, date: str, hour: int, url: str) -> None:
+    """INSERT one hour of GHArchive data into the Iceberg table."""
+    sql_with_retry(con, _insert_select(sql_quote(url)), f"hour={hour}")
+
+
+def insert_day(con: duckdb.DuckDBPyConnection, date: str, urls: list[str]) -> None:
+    """INSERT all available hours for a day in a single statement."""
+    sql_with_retry(con, _insert_select(sql_list_literal(urls)), f"day={date}")
 
 
 def run_etl(cfg: Config) -> None:
@@ -206,9 +249,11 @@ def run_etl(cfg: Config) -> None:
     if not existing:
         raise ETLError(f"no source files found for {cfg.date} (tried {len(urls)} hourly URLs)")
 
+    existing_urls = sorted(existing)  # deterministic order for day mode
     missing = len(urls) - len(existing)
     scope = f"max_hours={cfg.max_hours}" if cfg.max_hours else "full_day"
-    print(f"date={cfg.date} {scope} source_files={len(existing)}/{len(urls)}"
+    print(f"date={cfg.date} {scope} batch={cfg.batch_mode} "
+          f"source_files={len(existing)}/{len(urls)}"
           + (f" missing={missing}" if missing else ""))
 
     import duckdb
@@ -248,6 +293,28 @@ def run_etl(cfg: Config) -> None:
         ) PARTITIONED BY (day(created_at));
     """)
 
+    if cfg.batch_mode == "day":
+        _run_day_batch(con, cfg, existing_urls, missing)
+    else:
+        _run_hour_batch(con, cfg, urls, existing, missing)
+
+    # Verify total rows for the date.
+    total_rows = con.sql(f"""
+        SELECT COUNT(*) FROM r2_catalog.gharchive.events
+        WHERE created_at >= TIMESTAMP '{cfg.date} 00:00:00'
+          AND created_at <  TIMESTAMP '{cfg.date} 00:00:00' + INTERVAL 1 day
+    """).fetchone()[0]
+
+    if missing:
+        print(f"note: {missing} hourly file(s) were unavailable and skipped")
+    print(f"done: date={cfg.date} total_rows={total_rows:,}")
+
+
+def _run_hour_batch(
+    con: duckdb.DuckDBPyConnection, cfg: Config,
+    urls: list[str], existing: set[str], missing: int,
+) -> None:
+    """Per-hour INSERT mode: one INSERT per hour (24 commits/day)."""
     inserted = 0
     skipped_existing = 0
     skipped_missing = 0
@@ -271,18 +338,25 @@ def run_etl(cfg: Config) -> None:
         except Exception as e:
             raise ETLError(f"hour={hour} insert failed: {type(e).__name__}: {e}")
 
-    # Verify total rows for the date.
-    total_rows = con.sql(f"""
-        SELECT COUNT(*) FROM r2_catalog.gharchive.events
-        WHERE created_at >= TIMESTAMP '{cfg.date} 00:00:00'
-          AND created_at <  TIMESTAMP '{cfg.date} 00:00:00' + INTERVAL 1 day
-    """).fetchone()[0]
-
-    print(f"done: date={cfg.date} hours_inserted={inserted} "
+    print(f"  summary: hours_inserted={inserted} "
           f"hours_skipped_existing={skipped_existing} "
-          f"hours_missing={skipped_missing} total_rows={total_rows:,}")
-    if missing:
-        print(f"note: {missing} hourly file(s) were unavailable and skipped")
+          f"hours_missing={skipped_missing}")
+
+
+def _run_day_batch(
+    con: duckdb.DuckDBPyConnection, cfg: Config,
+    existing_urls: list[str], missing: int,
+) -> None:
+    """Per-day INSERT mode: all hours batched into one INSERT (1 commit/day)."""
+    if day_has_data(con, cfg.date):
+        print(f"  status=skipped_existing (day already has data)")
+        return
+
+    try:
+        insert_day(con, cfg.date, existing_urls)
+        print(f"  status=inserted ({len(existing_urls)} hours batched in one commit)")
+    except Exception as e:
+        raise ETLError(f"day insert failed: {type(e).__name__}: {e}")
 
 
 def main() -> None:

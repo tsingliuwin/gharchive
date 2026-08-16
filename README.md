@@ -131,29 +131,45 @@ on a repo cheap via Parquet row-group statistics.
 
 # GHArchive → Cloudflare R2 (Apache Iceberg)
 
-A second pipeline that writes each hour of GitHub Archive data directly into
-an Apache Iceberg table on the R2 Data Catalog. Instead of pre-combining 24
-hours into one Parquet file, each hour is a separate `INSERT` — Iceberg
-handles file layout and small-file compaction automatically. Querying an
-Iceberg table is as natural as querying a regular table.
+A second pipeline that writes GitHub Archive data into an Apache Iceberg
+table on the R2 Data Catalog. Iceberg handles file layout and small-file
+compaction automatically — no manual pre-combining. Querying an Iceberg
+table is as natural as querying a regular table.
+
+Two batch modes:
+
+- **`hour`** (default) — one `INSERT` per hour (24 commits/day). Best for
+  daily incremental updates.
+- **`day`** — all 24 hours batched into a single `INSERT` (1 commit/day).
+  Best for backfilling large amounts of historical data.
 
 ## Pipeline
 
 ```
-data.gharchive.org/{date}-{0..23}.json.gz
-        │  read over HTTPS via DuckDB httpfs (one hour at a time)
-        ▼
-   read_json_auto(url, ignore_errors=false)
-        │  SELECT id, type, actor.login, repo.name, created_at::TIMESTAMP
-        ▼
-   INSERT INTO r2_catalog.gharchive.events   (Iceberg, partitioned by day)
-       24 inserts/day → 24 snapshots → Iceberg compacts small files
+BATCH_MODE=hour (default, for daily incremental):
+  data.gharchive.org/{date}-{0..23}.json.gz
+          │  read one hour at a time via DuckDB httpfs
+          ▼
+     read_json_auto(url, ignore_errors=false)
+          │  SELECT id, type, actor.login, repo.name, created_at::TIMESTAMP
+          ▼
+     INSERT INTO r2_catalog.gharchive.events   (Iceberg, partitioned by day)
+         24 inserts/day → 24 snapshots → Iceberg compacts small files
+
+BATCH_MODE=day (for backfill):
+  data.gharchive.org/{date}-{0..23}.json.gz
+          │  read all hours at once via DuckDB httpfs
+          ▼
+     read_json_auto([url0, url1, ... url23], ignore_errors=false)
+          │  SELECT id, type, actor.login, repo.name, created_at::TIMESTAMP
+          ▼
+     INSERT INTO r2_catalog.gharchive.events   (Iceberg, partitioned by day)
+         1 insert/day → 1 snapshot
 ```
 
 The table is partitioned by `day(created_at)`, so date-range queries prune
 to the relevant partitions. Missing or still-uploading hourly files are
-skipped after a HEAD check, and each hour is idempotent (re-runs only
-process hours not yet written).
+skipped after a HEAD check.
 
 ## Set up the R2 Data Catalog
 
@@ -191,16 +207,20 @@ secret**, add:
 ## Run it
 
 Push the `gharchive-to-iceberg.yml` workflow. It runs at 04:00 UTC each day
-for the previous day. To backfill, use **Actions → GHArchive to Iceberg →
-Run workflow** and enter either:
+for the previous day in `hour` mode (24 per-hour INSERTs).
 
-- `YYYY-MM-DD` — one day, one job.
-- `YYYY-MM` — the whole month. A `prepare` job fans out to one matrix job
-  per day (up to 4 in parallel). `max-parallel` is 4 (not 8) to reduce
-  concurrent commit conflicts on the shared Iceberg table; the script also
-  retries on commit failures with exponential backoff.
+To backfill, use **Actions → GHArchive to Iceberg → Run workflow**:
 
-Leave the field empty for yesterday (used by the daily cron).
+- **date** — `YYYY-MM-DD` for one day, or `YYYY-MM` for a whole month. A
+  `prepare` job fans out to one matrix job per day (up to 4 in parallel).
+  Leave empty for yesterday (used by the daily cron).
+- **batch_mode** — `hour` (default) or `day`. Use `day` for backfilling:
+  one INSERT per day instead of 24, which is much faster for large
+  historical loads. The daily cron always uses `hour`.
+
+`max-parallel` is 4 (not 8) to reduce concurrent commit conflicts on the
+shared Iceberg table; the script also retries on commit failures with
+exponential backoff.
 
 ## Testing
 
@@ -213,8 +233,17 @@ R2_CATALOG_URI=... R2_WAREHOUSE=... R2_API_TOKEN=... \
   .venv/bin/python gharchive_to_iceberg.py
 ```
 
-`MAX_HOURS=1` limits the run to the first hourly file for a quick smoke
-test. `MAX_HOURS` can be 1–24.
+**Full day in day-batch mode (~5 min)** — tests the backfill path with one
+INSERT for all 24 hours.
+
+```bash
+R2_CATALOG_URI=... R2_WAREHOUSE=... R2_API_TOKEN=... \
+  DATE=2024-01-01 BATCH_MODE=day \
+  .venv/bin/python gharchive_to_iceberg.py
+```
+
+`MAX_HOURS` limits the run to the first N hourly files (1–24) for a quick
+smoke test. `BATCH_MODE` can be `hour` (default) or `day`.
 
 ## Table schema
 
@@ -232,13 +261,14 @@ partition gives date-range pruning.
 
 ## Idempotency
 
-Before INSERTing an hour, the script checks whether the table already has
-rows for that hour (`SELECT 1 … LIMIT 1`). If it does, that hour is
-skipped. This means:
+Before INSERTing, the script checks whether the table already has rows for
+the relevant time range:
 
-- Re-running a completed day is a no-op.
-- Re-running a partially failed day only processes the hours that were not
-  yet written.
+- **`hour` mode**: per-hour check (`SELECT 1 … WHERE created_at in this
+  hour LIMIT 1`). If an hour already has data, it is skipped. Re-running a
+  partially failed day only processes the hours not yet written.
+- **`day` mode**: per-day check. If the day already has data, the entire
+  day is skipped. Re-running a completed day is a no-op.
 
 Iceberg INSERTs are atomic — a failed commit leaves no partial data, so a
 retry (manual or automatic) won't create duplicates.

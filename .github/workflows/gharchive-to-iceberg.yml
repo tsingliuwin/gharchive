@@ -11,10 +11,23 @@ on:
         description: 'YYYY-MM-DD for one day, or YYYY-MM for a whole month. Empty = yesterday.'
         required: false
         default: ''
+      batch_mode:
+        description: 'hour = per-hour INSERT (24 commits/day, for daily incremental). day = per-day INSERT (1 commit/day, for backfill).'
+        required: false
+        default: 'hour'
+        type: choice
+        options:
+          - hour
+          - day
 
 # A month input fans out to one parallel job per day; a single day or the
-# daily cron runs exactly one job. Each job INSERTs 24 hourly batches into
-# the Iceberg table on the R2 Data Catalog.
+# daily cron runs exactly one job.
+#
+# BATCH_MODE:
+#   hour (default) — one INSERT per hour (24 commits/day). Best for daily
+#     incremental updates. The daily cron uses this.
+#   day — all 24 hours batched into one INSERT (1 commit/day). Best for
+#     backfilling historical data.
 #
 # max-parallel is 4 (not 8) to reduce concurrent commit conflicts on the
 # shared Iceberg table. The script retries on commit failures with
@@ -57,4 +70,5 @@ jobs:
           R2_WAREHOUSE: ${{ secrets.R2_WAREHOUSE }}
           R2_API_TOKEN: ${{ secrets.R2_API_TOKEN }}
           DATE: ${{ matrix.day }}
+          BATCH_MODE: ${{ inputs.batch_mode || 'hour' }}
         run: python gharchive_to_iceberg.py
