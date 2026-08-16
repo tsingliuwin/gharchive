@@ -60,8 +60,8 @@ if TYPE_CHECKING:
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 MONTH_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 
-MAX_RETRIES = 3
-RETRY_BASE_DELAY = 2  # seconds
+MAX_RETRIES = 5
+RETRY_BASE_DELAY = 5  # seconds
 
 
 class ETLError(RuntimeError):
@@ -246,11 +246,32 @@ def ensure_table(con: duckdb.DuckDBPyConnection, sample_url: str) -> None:
     print(f"  table created ({len(schema_rows)} columns from schema inference)")
 
 
-def sql_with_retry(con: duckdb.DuckDBPyConnection, sql: str, label: str) -> None:
+def refresh_catalog(con: duckdb.DuckDBPyConnection, cfg: Config) -> None:
+    """Force DuckDB to re-read Iceberg table metadata.
+
+    After a commit conflict, DuckDB may cache the stale snapshot ID. Detaching
+    and re-attaching the catalog forces a fresh metadata read so the retry
+    uses the new snapshot.
+    """
+    con.sql("DETACH r2_catalog;")
+    con.sql(f"""
+        ATTACH {sql_quote(cfg.warehouse)} AS r2_catalog (
+            TYPE ICEBERG,
+            ENDPOINT {sql_quote(cfg.catalog_uri)}
+        );
+    """)
+
+
+def sql_with_retry(
+    con: duckdb.DuckDBPyConnection, sql: str, label: str,
+    refresh_fn: callable | None = None,
+) -> None:
     """Execute a write SQL statement with retry on Iceberg commit conflict.
 
     Iceberg INSERTs are atomic — a failed commit leaves no partial data,
-    so a retry (manual or automatic) won't create duplicates.
+    so a retry (manual or automatic) won't create duplicates. Before each
+    retry, refresh_fn (if provided) is called to force a metadata refresh
+    so the retry picks up the new snapshot ID.
     """
     last_exc: Exception | None = None
     for attempt in range(MAX_RETRIES):
@@ -263,20 +284,28 @@ def sql_with_retry(con: duckdb.DuckDBPyConnection, sql: str, label: str) -> None
                 delay = RETRY_BASE_DELAY * (2 ** attempt)
                 print(f"  {label}: commit conflict, retry {attempt + 1}/{MAX_RETRIES} in {delay}s ...")
                 time.sleep(delay)
+                if refresh_fn:
+                    refresh_fn()
                 continue
             raise
     if last_exc:
         raise last_exc
 
 
-def insert_hour(con: duckdb.DuckDBPyConnection, date: str, hour: int, url: str) -> None:
+def insert_hour(con: duckdb.DuckDBPyConnection, cfg: Config, date: str, hour: int, url: str) -> None:
     """INSERT one hour of GHArchive data into the Iceberg table."""
-    sql_with_retry(con, _insert_select(sql_quote(url)), f"hour={hour}")
+    sql_with_retry(
+        con, _insert_select(sql_quote(url)), f"hour={hour}",
+        refresh_fn=lambda: refresh_catalog(con, cfg),
+    )
 
 
-def insert_day(con: duckdb.DuckDBPyConnection, date: str, urls: list[str]) -> None:
+def insert_day(con: duckdb.DuckDBPyConnection, cfg: Config, date: str, urls: list[str]) -> None:
     """INSERT all available hours for a day in a single statement."""
-    sql_with_retry(con, _insert_select(sql_list_literal(urls)), f"day={date}")
+    sql_with_retry(
+        con, _insert_select(sql_list_literal(urls)), f"day={date}",
+        refresh_fn=lambda: refresh_catalog(con, cfg),
+    )
 
 
 def run_etl(cfg: Config) -> None:
@@ -361,7 +390,7 @@ def _run_hour_batch(
         # loudly (no partial write — Iceberg INSERTs are atomic). Only that
         # hour fails; the remaining hours are still processed.
         try:
-            insert_hour(con, cfg.date, hour, url)
+            insert_hour(con, cfg, cfg.date, hour, url)
             print(f"  hour={hour} status=inserted")
             inserted += 1
         except Exception as e:
@@ -382,7 +411,7 @@ def _run_day_batch(
         return
 
     try:
-        insert_day(con, cfg.date, existing_urls)
+        insert_day(con, cfg, cfg.date, existing_urls)
         print(f"  status=inserted ({len(existing_urls)} hours batched in one commit)")
     except Exception as e:
         raise ETLError(f"day insert failed: {type(e).__name__}: {e}")
